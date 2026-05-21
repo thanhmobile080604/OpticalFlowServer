@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore")
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 import shutil
 import os
 import uuid
@@ -12,6 +13,15 @@ import threading
 from dataclasses import dataclass, asdict
 from typing import Optional
 from inference import OpticalFlowProcessor
+
+LOG_LEVEL = os.getenv("OPTICAL_FLOW_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("optical_flow.server")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logging.getLogger("optical_flow").setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 app = FastAPI(title="Optical Flow Server")
 
@@ -35,10 +45,12 @@ elif os.path.exists(ALT_MODEL):
 else:
     MODEL_PATH = DEFAULT_MODEL
 try:
+    logger.info("Loading optical-flow model path=%s exists=%s", MODEL_PATH, os.path.exists(MODEL_PATH))
     processor = OpticalFlowProcessor(MODEL_PATH)
-    print(f"Successfully loaded model from {MODEL_PATH}")
+    providers = processor.session.get_providers() if getattr(processor, "session", None) else []
+    logger.info("Successfully loaded model path=%s providers=%s", MODEL_PATH, providers)
 except Exception as e:
-    print(f"Warning: Failed to load model {MODEL_PATH}. Error: {e}")
+    logger.exception("Failed to load model path=%s error=%s", MODEL_PATH, e)
     processor = None
 
 @dataclass
@@ -62,8 +74,9 @@ def cleanup_files(file_paths):
         try:
             if os.path.exists(path):
                 os.remove(path)
+                logger.debug("Cleaned up temp file path=%s", path)
         except Exception as e:
-            print(f"Failed to cleanup {path}: {e}")
+            logger.warning("Failed to cleanup temp file path=%s error=%s", path, e)
 
 
 def set_video_job(job_id: str, **updates):
@@ -88,6 +101,11 @@ def remove_video_job(job_id: str):
 def run_video_job(job_id: str):
     job = get_video_job(job_id)
     if not job:
+        logger.warning("Video job missing before processing job_id=%s", job_id)
+        return
+    if not processor:
+        set_video_job(job_id, status="failed", error="Model not loaded on server.")
+        logger.error("Video job cannot start because model is not loaded job_id=%s", job_id)
         return
 
     set_video_job(job_id, status="processing", progress=0)
@@ -96,17 +114,32 @@ def run_video_job(job_id: str):
         set_video_job(job_id, progress=max(0, min(100, int(percent))))
 
     try:
+        input_size = os.path.getsize(job.input_path) if os.path.exists(job.input_path) else -1
+        logger.info(
+            "Video job started job_id=%s mode=%s is_moving=%s vector_direction_sign=%.1f input_path=%s input_size_bytes=%s output_path=%s",
+            job_id,
+            job.mode,
+            job.is_moving,
+            vector_direction_sign,
+            job.input_path,
+            input_size,
+            job.output_path,
+        )
         processor.process_video(
             job.input_path,
             job.output_path,
             mode=job.mode.upper(),
             vector_direction_sign=vector_direction_sign,
+            req_id=job_id,
             progress_callback=update_progress,
         )
         set_video_job(job_id, status="completed", progress=100)
+        output_size = os.path.getsize(job.output_path) if os.path.exists(job.output_path) else -1
+        logger.info("Video job completed job_id=%s output_path=%s output_size_bytes=%s", job_id, job.output_path, output_size)
     except Exception as e:
         cleanup_files([job.output_path])
         set_video_job(job_id, status="failed", error=str(e))
+        logger.exception("Video job failed job_id=%s mode=%s error=%s", job_id, job.mode, e)
     finally:
         cleanup_files([job.input_path])
 
@@ -124,6 +157,7 @@ async def process_video(
     is_moving: true if the camera is moving forward, false if moving backward/stationary (affects vector direction)
     """
     if not processor:
+        logger.error("Synchronous process-video rejected because model is not loaded filename=%s", file.filename)
         return {"error": "Model not loaded on server."}
 
     # Save uploaded video to system temporary files
@@ -138,13 +172,27 @@ async def process_video(
     output_temp.close()
 
     vector_direction_sign = 1.0 if is_moving else -1.0
+    mode_name = mode.upper()
+    input_size = os.path.getsize(input_path) if os.path.exists(input_path) else -1
+    logger.info(
+        "Synchronous video processing started filename=%s mode=%s is_moving=%s vector_direction_sign=%.1f input_path=%s input_size_bytes=%s output_path=%s",
+        file.filename,
+        mode_name,
+        is_moving,
+        vector_direction_sign,
+        input_path,
+        input_size,
+        output_path,
+    )
 
     try:
         # Process the video (no status file)
-        processor.process_video(input_path, output_path, mode=mode.upper(), vector_direction_sign=vector_direction_sign)
+        processor.process_video(input_path, output_path, mode=mode_name, vector_direction_sign=vector_direction_sign)
 
         # Schedule cleanup after sending response
         background_tasks.add_task(cleanup_files, [input_path, output_path])
+        output_size = os.path.getsize(output_path) if os.path.exists(output_path) else -1
+        logger.info("Synchronous video processing completed output_path=%s output_size_bytes=%s", output_path, output_size)
 
         return FileResponse(
             path=output_path,
@@ -154,6 +202,7 @@ async def process_video(
     except Exception as e:
         # cleanup temp files on error
         cleanup_files([input_path, output_path])
+        logger.exception("Synchronous video processing failed filename=%s mode=%s error=%s", file.filename, mode_name, e)
         return {"error": str(e)}
 
 
@@ -169,6 +218,7 @@ async def create_process_video_job(
     This avoids holding a long HTTP request open while RAFT processing runs.
     """
     if not processor:
+        logger.error("Async process-video job rejected because model is not loaded filename=%s", file.filename)
         raise HTTPException(status_code=503, detail="Model not loaded on server.")
 
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
@@ -182,18 +232,30 @@ async def create_process_video_job(
     output_temp.close()
 
     job_id = uuid.uuid4().hex
+    mode_name = mode.upper()
     job = VideoJob(
         job_id=job_id,
         status="queued",
         input_path=input_path,
         output_path=output_path,
-        mode=mode.upper(),
+        mode=mode_name,
         is_moving=is_moving,
         progress=0,
     )
     with video_jobs_lock:
         video_jobs[job_id] = job
 
+    input_size = os.path.getsize(input_path) if os.path.exists(input_path) else -1
+    logger.info(
+        "Video job queued job_id=%s filename=%s mode=%s is_moving=%s input_path=%s input_size_bytes=%s output_path=%s",
+        job_id,
+        file.filename,
+        mode_name,
+        is_moving,
+        input_path,
+        input_size,
+        output_path,
+    )
     background_tasks.add_task(run_video_job, job_id)
     return {"job_id": job_id, "status": job.status}
 
@@ -215,12 +277,16 @@ def get_process_video_job_result(job_id: str, background_tasks: BackgroundTasks)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job.status == "failed":
+        logger.warning("Video job result requested but job failed job_id=%s error=%s", job_id, job.error)
         raise HTTPException(status_code=500, detail=job.error or "Video processing failed.")
     if job.status != "completed":
         raise HTTPException(status_code=409, detail=f"Job is not completed yet: {job.status}.")
     if not os.path.exists(job.output_path):
+        logger.warning("Video job result missing output file job_id=%s output_path=%s", job_id, job.output_path)
         raise HTTPException(status_code=410, detail="Processed video is no longer available.")
 
+    output_size = os.path.getsize(job.output_path) if os.path.exists(job.output_path) else -1
+    logger.info("Video job result returned job_id=%s output_path=%s output_size_bytes=%s", job_id, job.output_path, output_size)
     background_tasks.add_task(cleanup_files, [job.output_path])
     background_tasks.add_task(remove_video_job, job_id)
     return FileResponse(
