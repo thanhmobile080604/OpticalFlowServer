@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import os
+import json
 import uuid
 from inference import OpticalFlowProcessor
 
@@ -20,7 +21,16 @@ app.add_middleware(
 )
 
 # Initialize the model processor
-MODEL_PATH = "optical_flow_estimation_raft_2023aug_int8bq.onnx"
+DEFAULT_MODEL = "optical_flow_estimation_raft_2023aug_int8bq.onnx"
+DEQUANT_MODEL = "optical_flow_estimation_raft_2023aug_dequant.onnx"
+ALT_MODEL = "optical_flow_estimation_raft_2023aug.onnx"
+# Prefer dequantized float model, then alternate float model, then default int8 model
+if os.path.exists(DEQUANT_MODEL):
+    MODEL_PATH = DEQUANT_MODEL
+elif os.path.exists(ALT_MODEL):
+    MODEL_PATH = ALT_MODEL
+else:
+    MODEL_PATH = DEFAULT_MODEL
 try:
     processor = OpticalFlowProcessor(MODEL_PATH)
     print(f"Successfully loaded model from {MODEL_PATH}")
@@ -38,6 +48,10 @@ def cleanup_files(file_paths):
                 os.remove(path)
         except Exception as e:
             print(f"Failed to cleanup {path}: {e}")
+
+
+def status_file_for(req_id: str):
+    return os.path.join(TEMP_DIR, f"{req_id}_status.json")
 
 @app.post("/process-video")
 async def process_video(
@@ -69,10 +83,12 @@ async def process_video(
     
     try:
         # Process the video
-        processor.process_video(input_path, output_path, mode=mode.upper(), vector_direction_sign=vector_direction_sign)
+        processor.process_video(input_path, output_path, mode=mode.upper(), vector_direction_sign=vector_direction_sign, req_id=req_id)
         
         # Schedule cleanup after sending response
-        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        # also cleanup status file
+        status_path = status_file_for(req_id)
+        background_tasks.add_task(cleanup_files, [input_path, output_path, status_path])
         
         return FileResponse(
             path=output_path, 
@@ -80,8 +96,22 @@ async def process_video(
             filename=output_filename
         )
     except Exception as e:
-        cleanup_files([input_path, output_path])
+        # cleanup status file on error
+        status_path = status_file_for(req_id)
+        cleanup_files([input_path, output_path, status_path])
         return {"error": str(e)}
+
+
+@app.get('/status/{req_id}')
+def get_status(req_id: str):
+    status_path = status_file_for(req_id)
+    if os.path.exists(status_path):
+        try:
+            with open(status_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {"percent": 0}
+    return {"percent": 0}
 
 @app.get("/health")
 def health_check():

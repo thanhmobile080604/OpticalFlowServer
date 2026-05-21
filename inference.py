@@ -2,11 +2,21 @@ import cv2
 import numpy as np
 import os
 import math
+import json
+import onnxruntime as ort
 
 class OpticalFlowProcessor:
     def __init__(self, model_path: str):
         self.model_path = model_path
-        self.net = cv2.dnn.readNet(model_path)
+        # Use onnxruntime session instead of OpenCV DNN to support quantized ONNX models
+        providers = None
+        try:
+            # Prefer CUDAExecutionProvider if available
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            self.session = ort.InferenceSession(self.model_path, providers=providers)
+        except Exception:
+            # Fallback to default CPU provider
+            self.session = ort.InferenceSession(self.model_path)
         
         self.input_width = 480
         self.input_height = 360
@@ -30,19 +40,57 @@ class OpticalFlowProcessor:
     def prepare_blob(self, img):
         # Convert to RGB (swapRB=True in OpenCV is equivalent to BGR2RGB)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # blobFromImage: scale=1.0, size=(480, 360), swapRB=False (we already converted)
-        blob = cv2.dnn.blobFromImage(img_rgb, 1.0, (self.input_width, self.input_height), (0, 0, 0), swapRB=False, crop=False)
+        # Resize and convert to float32 NCHW format: (1, C, H, W)
+        resized = cv2.resize(img_rgb, (self.input_width, self.input_height), interpolation=cv2.INTER_AREA)
+        arr = resized.astype(np.float32)
+        # Normalize to [0,1]
+        arr /= 255.0
+        # HWC -> CHW
+        chw = np.transpose(arr, (2, 0, 1))
+        blob = np.expand_dims(chw, axis=0)
         return blob
 
     def infer(self, prev_frame, curr_frame):
         prev_blob = self.prepare_blob(prev_frame)
         curr_blob = self.prepare_blob(curr_frame)
-        
-        self.net.setInput(prev_blob, "0")
-        self.net.setInput(curr_blob, "1")
-        
-        output = self.net.forward()
-        return output
+
+        # Build inputs for the ONNX model based on expected inputs
+        input_meta = self.session.get_inputs()
+        feed = {}
+
+        try:
+            if len(input_meta) == 2:
+                # Model expects two inputs (e.g., named "0" and "1")
+                feed[input_meta[0].name] = prev_blob
+                feed[input_meta[1].name] = curr_blob
+            elif len(input_meta) == 1:
+                # Single input: concatenate along channel dimension -> (1,6,H,W)
+                single_shape = input_meta[0].shape
+                # Determine if model expects NHWC or NCHW by checking input shape layout
+                if len(single_shape) == 4 and (single_shape[1] == 3 or single_shape[1] == 6):
+                    # NCHW expected
+                    concatenated = np.concatenate([prev_blob, curr_blob], axis=1)
+                    feed[input_meta[0].name] = concatenated
+                elif len(single_shape) == 4 and (single_shape[3] == 3 or single_shape[3] == 6):
+                    # NHWC expected, convert blobs to NHWC
+                    prev_nhwc = np.transpose(prev_blob, (0, 2, 3, 1))
+                    curr_nhwc = np.transpose(curr_blob, (0, 2, 3, 1))
+                    concatenated = np.concatenate([prev_nhwc, curr_nhwc], axis=3)
+                    feed[input_meta[0].name] = concatenated
+                else:
+                    # Fallback: try channel concat
+                    concatenated = np.concatenate([prev_blob, curr_blob], axis=1)
+                    feed[input_meta[0].name] = concatenated
+            else:
+                # Generic: map first two inputs if available
+                for i, meta in enumerate(input_meta[:2]):
+                    feed[meta.name] = prev_blob if i == 0 else curr_blob
+
+            outputs = self.session.run(None, feed)
+            # Return first output
+            return outputs[0]
+        except Exception as e:
+            raise RuntimeError(f"ONNX inference failed: {e}")
 
     def compute_centered_grid_start(self, size, step):
         if size <= step:
@@ -177,7 +225,7 @@ class OpticalFlowProcessor:
             
         return result_frame
 
-    def process_video(self, input_video_path, output_video_path, mode="VECTORS", vector_direction_sign=-1.0):
+    def process_video(self, input_video_path, output_video_path, mode="VECTORS", vector_direction_sign=-1.0, req_id: str = None):
         cap = cv2.VideoCapture(input_video_path)
         if not cap.isOpened():
             raise Exception(f"Failed to open video: {input_video_path}")
@@ -197,11 +245,34 @@ class OpticalFlowProcessor:
             cap.release()
             out.release()
             return
+        # Setup status tracking
+        status_path = None
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        except Exception:
+            total_frames = 0
+        if req_id is not None:
+            status_path = os.path.join('temp_videos', f"{req_id}_status.json")
+            try:
+                with open(status_path, 'w') as f:
+                    json.dump({"percent": 0}, f)
+            except Exception:
+                status_path = None
             
         try:
             # Write first frame
             out.write(prev_frame)
             
+            frames_processed = 1
+            # report initial progress (first frame written)
+            if status_path is not None and total_frames > 0:
+                try:
+                    pct = int((frames_processed / total_frames) * 100)
+                    with open(status_path, 'w') as f:
+                        json.dump({"percent": pct}, f)
+                except Exception:
+                    pass
+
             while True:
                 ret, curr_frame = cap.read()
                 if not ret:
@@ -216,6 +287,16 @@ class OpticalFlowProcessor:
                     
                 out.write(result_frame)
                 prev_frame = curr_frame
+                frames_processed += 1
+                # update status every 5 frames
+                if status_path is not None and total_frames > 0 and frames_processed % 5 == 0:
+                    try:
+                        pct = int((frames_processed / total_frames) * 100)
+                        pct = min(100, pct)
+                        with open(status_path, 'w') as f:
+                            json.dump({"percent": pct}, f)
+                    except Exception:
+                        pass
         finally:
             cap.release()
             out.release()
