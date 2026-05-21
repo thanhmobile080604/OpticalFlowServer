@@ -1,0 +1,19 @@
+# Copy this file to %USERPROFILE%\.cloudflared\config.yml after creating
+# a Cloudflare Tunnel, then replace the placeholders below.
+#
+# Local service:
+#   python -m uvicorn main:app --host 127.0.0.1 --port 8000
+#
+# Public route:
+#   https://optical-flow.example.com -> http://127.0.0.1:8000
+
+tunnel: "<TUNNEL_UUID_OR_NAME>"
+credentials-file: "C:\\Users\\Admin\\.cloudflared\\<TUNNEL_UUID>.json"
+
+originRequest:
+  connectTimeout: 30s
+
+ingress:
+  - hostname: optical-flow.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404

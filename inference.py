@@ -225,7 +225,15 @@ class OpticalFlowProcessor:
             
         return result_frame
 
-    def process_video(self, input_video_path, output_video_path, mode="VECTORS", vector_direction_sign=-1.0, req_id: str = None):
+    def process_video(
+        self,
+        input_video_path,
+        output_video_path,
+        mode="VECTORS",
+        vector_direction_sign=-1.0,
+        req_id: str = None,
+        progress_callback=None,
+    ):
         cap = cv2.VideoCapture(input_video_path)
         if not cap.isOpened():
             raise Exception(f"Failed to open video: {input_video_path}")
@@ -251,27 +259,37 @@ class OpticalFlowProcessor:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         except Exception:
             total_frames = 0
+        def report_progress(percent):
+            percent = max(0, min(100, int(percent)))
+            if progress_callback is not None:
+                try:
+                    progress_callback(percent)
+                except Exception:
+                    pass
+            if status_path is not None:
+                try:
+                    with open(status_path, 'w') as f:
+                        json.dump({"percent": percent}, f)
+                except Exception:
+                    pass
+
         if req_id is not None:
             status_path = os.path.join('temp_videos', f"{req_id}_status.json")
             try:
-                with open(status_path, 'w') as f:
-                    json.dump({"percent": 0}, f)
+                os.makedirs(os.path.dirname(status_path), exist_ok=True)
             except Exception:
                 status_path = None
+        report_progress(0)
             
+        completed = False
         try:
             # Write first frame
             out.write(prev_frame)
             
             frames_processed = 1
             # report initial progress (first frame written)
-            if status_path is not None and total_frames > 0:
-                try:
-                    pct = int((frames_processed / total_frames) * 100)
-                    with open(status_path, 'w') as f:
-                        json.dump({"percent": pct}, f)
-                except Exception:
-                    pass
+            if total_frames > 0:
+                report_progress((frames_processed / total_frames) * 100)
 
             while True:
                 ret, curr_frame = cap.read()
@@ -289,14 +307,11 @@ class OpticalFlowProcessor:
                 prev_frame = curr_frame
                 frames_processed += 1
                 # update status every 5 frames
-                if status_path is not None and total_frames > 0 and frames_processed % 5 == 0:
-                    try:
-                        pct = int((frames_processed / total_frames) * 100)
-                        pct = min(100, pct)
-                        with open(status_path, 'w') as f:
-                            json.dump({"percent": pct}, f)
-                    except Exception:
-                        pass
+                if total_frames > 0 and frames_processed % 5 == 0:
+                    report_progress((frames_processed / total_frames) * 100)
+            completed = True
         finally:
             cap.release()
             out.release()
+            if completed:
+                report_progress(100)
