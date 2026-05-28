@@ -1,5 +1,6 @@
 - When you first git pull this repo:
 pip install -r (path to requirements.txt)
+- If video processing was updated, run the same command again so H.264/ffmpeg support is installed.
 - Download the cloudfare tunnel:
 https://developers.cloudflare.com/tunnel/downloads/
 - Rename the file to cloudflared.exe

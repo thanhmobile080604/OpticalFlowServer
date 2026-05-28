@@ -4,9 +4,184 @@ import os
 import math
 import json
 import logging
+import shutil
+import subprocess
 import onnxruntime as ort
 
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
+
 logger = logging.getLogger("optical_flow.inference")
+
+
+class ProcessingCancelled(Exception):
+    pass
+
+
+class H264Mp4Writer:
+    MAX_OUTPUT_FPS = 30.0
+
+    def __init__(self, output_path, source_fps, width, height, req_id=None):
+        self.output_path = output_path
+        self.source_fps = self._valid_fps(source_fps)
+        self.output_fps = min(self.source_fps, self.MAX_OUTPUT_FPS)
+        self.width = int(width)
+        self.height = int(height)
+        self.req_id = req_id
+        self.process = None
+        self.frames_written = 0
+
+    def open(self):
+        ffmpeg_exe = self._ffmpeg_exe()
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            f"{self.source_fps:.6f}",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-profile:v",
+            "main",
+            "-level",
+            "4.2",
+            "-tag:v",
+            "avc1",
+            "-movflags",
+            "+faststart",
+            "-r",
+            f"{self.output_fps:.6f}",
+            self.output_path,
+        ]
+
+        logger.info(
+            "Opening H.264 writer job_id=%s output_path=%s source_fps=%.3f output_fps=%.3f size=%sx%s",
+            self.req_id,
+            self.output_path,
+            self.source_fps,
+            self.output_fps,
+            self.width,
+            self.height,
+        )
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return self
+
+    def _ffmpeg_exe(self):
+        if imageio_ffmpeg is not None:
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg_exe = shutil.which("ffmpeg")
+        if ffmpeg_exe:
+            return ffmpeg_exe
+        raise RuntimeError(
+            "ffmpeg is required for Android-compatible H.264 output. "
+            "Run pip install -r requirements.txt or install ffmpeg in PATH."
+        )
+
+    def write(self, frame):
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("H.264 writer is not open")
+        if frame is None:
+            return
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+        try:
+            self.process.stdin.write(frame.tobytes())
+            self.frames_written += 1
+        except BrokenPipeError as e:
+            raise RuntimeError(f"H.264 writer stopped unexpectedly: {self._stderr_text()}") from e
+
+    def release(self):
+        if self.process is None:
+            return
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            return_code = self.process.wait(timeout=60)
+            if return_code != 0:
+                raise RuntimeError(
+                    f"H.264 encoding failed return_code={return_code} stderr={self._stderr_text()}"
+                )
+            logger.info(
+                "H.264 writer closed job_id=%s output_path=%s frames_written=%s output_fps=%.3f",
+                self.req_id,
+                self.output_path,
+                self.frames_written,
+                self.output_fps,
+            )
+        finally:
+            self.process = None
+
+    def cancel(self):
+        if self.process is None:
+            return
+        try:
+            if self.process.stdin is not None:
+                try:
+                    self.process.stdin.close()
+                except Exception:
+                    pass
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+            logger.info(
+                "H.264 writer cancelled job_id=%s output_path=%s frames_written=%s",
+                self.req_id,
+                self.output_path,
+                self.frames_written,
+            )
+        finally:
+            self.process = None
+
+    def _stderr_text(self):
+        if self.process is None or self.process.stderr is None:
+            return ""
+        if self.process.poll() is None:
+            return ""
+        try:
+            return self.process.stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _valid_fps(raw_fps):
+        try:
+            fps = float(raw_fps)
+        except (TypeError, ValueError):
+            return 30.0
+        if not math.isfinite(fps) or fps <= 0.0:
+            return 30.0
+        return min(max(fps, 1.0), 120.0)
+
 
 class OpticalFlowProcessor:
     def __init__(self, model_path: str):
@@ -412,6 +587,7 @@ class OpticalFlowProcessor:
         vector_direction_sign=-1.0,
         req_id: str = None,
         progress_callback=None,
+        cancel_callback=None,
     ):
         mode = (mode or "VECTORS").upper()
         if mode == "VECTOR":
@@ -439,9 +615,23 @@ class OpticalFlowProcessor:
                 logger.warning("Could not create status directory job_id=%s status_path=%s error=%s", req_id, status_path, e)
                 status_path = None
 
+        cancelled = False
         last_logged_progress = -1
+        def raise_if_cancelled():
+            nonlocal cancelled
+            if cancel_callback is not None:
+                try:
+                    if cancel_callback():
+                        cancelled = True
+                        raise ProcessingCancelled(f"Video job cancelled job_id={req_id}")
+                except ProcessingCancelled:
+                    raise
+                except Exception as e:
+                    logger.warning("Cancel callback failed job_id=%s error=%s", req_id, e)
+
         def report_progress(percent):
             nonlocal last_logged_progress
+            raise_if_cancelled()
             percent = max(0, min(100, int(percent)))
             if progress_callback is not None:
                 try:
@@ -459,6 +649,7 @@ class OpticalFlowProcessor:
                 last_logged_progress = percent
 
         report_progress(0)
+        raise_if_cancelled()
 
         cap = cv2.VideoCapture(input_video_path)
         if not cap.isOpened():
@@ -486,16 +677,14 @@ class OpticalFlowProcessor:
             if width <= 0 or height <= 0:
                 raise Exception(f"Invalid frame dimensions width={width} height={height}")
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-            if not out.isOpened():
-                raise Exception(f"Failed to open output video writer: {output_video_path} codec=mp4v fps={fps} size={width}x{height}")
+            out = H264Mp4Writer(output_video_path, fps, width, height, req_id=req_id).open()
 
             logger.info(
-                "Video metadata job_id=%s mode=%s fps=%.3f width=%s height=%s total_frames=%s flow_frame_offset=%s input_path=%s output_path=%s",
+                "Video metadata job_id=%s mode=%s input_fps=%.3f output_fps=%.3f width=%s height=%s total_frames=%s flow_frame_offset=%s input_path=%s output_path=%s codec=h264",
                 req_id,
                 mode,
                 fps,
+                out.output_fps,
                 width,
                 height,
                 total_frames,
@@ -507,6 +696,7 @@ class OpticalFlowProcessor:
             frame_buffer = [first_frame]
 
             while True:
+                raise_if_cancelled()
                 ret, curr_frame = cap.read()
                 if not ret:
                     break
@@ -522,7 +712,9 @@ class OpticalFlowProcessor:
                 frame_index = frames_processed + 1
                 flow_output = None
                 try:
+                    raise_if_cancelled()
                     flow_output = self.infer(source_frame, comparison_frame)
+                    raise_if_cancelled()
                     if frames_processed == 0:
                         logger.info(
                             "First flow output job_id=%s mode=%s frame=%s flow_summary=%s",
@@ -558,13 +750,17 @@ class OpticalFlowProcessor:
                     report_progress((frames_processed / total_frames) * 100)
 
             while frame_buffer:
+                raise_if_cancelled()
                 out.write(frame_buffer.pop(0))
                 frames_processed += 1
                 if total_frames > 0 and frames_processed % 5 == 0:
                     report_progress((frames_processed / total_frames) * 100)
+
+            out.release()
+            out = None
             completed = True
             logger.info(
-                "Video processing finished job_id=%s mode=%s frames_processed=%s total_frames=%s",
+                "Video processing finished job_id=%s mode=%s frames_processed=%s total_frames=%s codec=h264",
                 req_id,
                 mode,
                 frames_processed,
@@ -573,6 +769,9 @@ class OpticalFlowProcessor:
         finally:
             cap.release()
             if out is not None:
-                out.release()
+                if cancelled:
+                    out.cancel()
+                else:
+                    out.release()
             if completed:
                 report_progress(100)
