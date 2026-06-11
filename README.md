@@ -12,14 +12,14 @@ Do not install multiple ONNX Runtime backend packages together manually. They al
 
 ## First Setup
 
-From PowerShell:
+From PowerShell (run the setup script in the repo's docs folder):
 
 ```powershell
 cd C:\CODE\OpticalFlowServer
-.\setup.ps1
+.\docs\docs_to_set_up\setup.ps1
 ```
 
-`setup.ps1` detects the machine and installs one backend:
+`setup.ps1` (in `docs/docs_to_set_up`) detects the machine and installs one backend:
 
 - Quadro P400/Pascal on Windows -> DirectML
 - Newer NVIDIA GPU -> CUDA
@@ -28,14 +28,14 @@ cd C:\CODE\OpticalFlowServer
 Manual install options:
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -r docs/docs_to_set_up/requirements.txt
 ```
 
-`requirements.txt` is CPU-safe. For a specific GPU backend:
+`requirements.txt` (in `docs/docs_to_set_up`) is CPU-safe. For a specific GPU backend:
 
 ```powershell
-python -m pip install -r requirements-cuda.txt
-python -m pip install -r requirements-directml.txt
+python -m pip install -r docs/docs_to_set_up/requirements-cuda.txt
+python -m pip install -r docs/docs_to_set_up/requirements-directml.txt
 ```
 
 ## Run Server
@@ -43,6 +43,11 @@ python -m pip install -r requirements-directml.txt
 Run uvicorn in the foreground. This writes logs to the terminal only and does not create `uvicorn.*.log` files.
 
 ```powershell
+# From the repository root:
+python -m uvicorn src.main:app --host 0.0.0.0 --port 8000
+
+# Or change into the `src` folder and run:
+cd src
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 

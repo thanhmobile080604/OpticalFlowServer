@@ -15,6 +15,7 @@ import time
 import math
 from dataclasses import dataclass, asdict
 from typing import Optional
+from pathlib import Path
 from src.inference import NormalizedPoint, NormalizedRoi, OpticalFlowProcessor, ProcessingCancelled
 
 LOG_LEVEL = os.getenv("OPTICAL_FLOW_LOG_LEVEL", "INFO").upper()
@@ -37,16 +38,19 @@ app.add_middleware(
 )
 
 # Initialize the model processor
-DEFAULT_MODEL = "optical_flow_estimation_raft_2023aug_int8bq.onnx"
-DEQUANT_MODEL = "optical_flow_estimation_raft_2023aug_dequant.onnx"
-ALT_MODEL = "optical_flow_estimation_raft_2023aug.onnx"
+# Models are stored in the repository-level `AI_model` directory
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MODEL_DIR = REPO_ROOT / "AI_model"
+DEFAULT_MODEL = MODEL_DIR / "optical_flow_estimation_raft_2023aug_int8bq.onnx"
+DEQUANT_MODEL = MODEL_DIR / "optical_flow_estimation_raft_2023aug_dequant.onnx"
+ALT_MODEL = MODEL_DIR / "optical_flow_estimation_raft_2023aug.onnx"
 # Prefer dequantized float model, then alternate float model, then default int8 model
-if os.path.exists(DEQUANT_MODEL):
-    MODEL_PATH = DEQUANT_MODEL
-elif os.path.exists(ALT_MODEL):
-    MODEL_PATH = ALT_MODEL
+if DEQUANT_MODEL.exists():
+    MODEL_PATH = str(DEQUANT_MODEL)
+elif ALT_MODEL.exists():
+    MODEL_PATH = str(ALT_MODEL)
 else:
-    MODEL_PATH = DEFAULT_MODEL
+    MODEL_PATH = str(DEFAULT_MODEL)
 try:
     logger.info("Loading optical-flow model path=%s exists=%s", MODEL_PATH, os.path.exists(MODEL_PATH))
     processor = OpticalFlowProcessor(MODEL_PATH)
@@ -116,7 +120,6 @@ def cleanup_files(file_paths):
 
 
 
-
 def cleanup_directory(path):
     try:
         if path and os.path.isdir(path):
@@ -165,9 +168,6 @@ def video_job_counts():
         "max_concurrent": MAX_CONCURRENT_VIDEO_JOBS,
         "max_pending": MAX_PENDING_VIDEO_JOBS,
     }
-
-
-
 def get_video_upload(upload_id: str) -> Optional[VideoUpload]:
     with video_uploads_lock:
         return video_uploads.get(upload_id)
