@@ -7,7 +7,9 @@ import logging
 import shutil
 import subprocess
 import onnxruntime as ort
+import site
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -213,26 +215,56 @@ class H264Mp4Writer:
 class OpticalFlowProcessor:
     def __init__(self, model_path: str):
         self.model_path = model_path
+        self.cuda_dll_dirs = []
+        self._cuda_dll_directory_handles = []
+        self.gpu_fallback_error = None
         # Use onnxruntime session instead of OpenCV DNN to support quantized ONNX models
-        providers = None
+        self.available_providers = ort.get_available_providers()
+        providers = self.resolve_execution_providers()
+        session_options = self.create_session_options()
+        self.preload_cuda_dlls_if_needed(providers)
+        logger.info(
+            "Initializing ONNX session model=%s requested_providers=%s available_providers=%s",
+            self.model_path,
+            self.provider_names(providers),
+            self.available_providers,
+        )
         try:
-            # Prefer CUDAExecutionProvider if available
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-        except Exception as e:
-            logger.warning(
-                "Preferred ONNX providers failed, falling back to default providers model=%s providers=%s error=%s",
+            self.session = ort.InferenceSession(
                 self.model_path,
-                providers,
+                sess_options=session_options,
+                providers=providers,
+            )
+        except Exception as e:
+            if "CPUExecutionProvider" not in self.available_providers:
+                raise
+            logger.warning(
+                "GPU/preferred ONNX providers failed, falling back to CPU model=%s providers=%s error=%s",
+                self.model_path,
+                self.provider_names(providers),
                 e,
             )
-            # Fallback to default CPU provider
-            self.session = ort.InferenceSession(self.model_path)
+            self.session = ort.InferenceSession(
+                self.model_path,
+                sess_options=session_options,
+                providers=["CPUExecutionProvider"],
+            )
+        self.active_providers = self.session.get_providers()
+        self.execution_provider = self.active_providers[0] if self.active_providers else "unknown"
+        if self.execution_provider in ("CUDAExecutionProvider", "DmlExecutionProvider"):
+            logger.info("ONNX Runtime is using GPU provider=%s model=%s", self.execution_provider, self.model_path)
+        else:
+            logger.warning(
+                "ONNX Runtime is not using a GPU provider=%s available_providers=%s. "
+                "Install a compatible GPU provider/runtime to enable GPU inference.",
+                self.execution_provider,
+                self.available_providers,
+            )
         self.flow_output_index = self.select_flow_output_index(self.session.get_outputs())
         logger.info(
             "ONNX session ready model=%s providers=%s inputs=%s outputs=%s flow_output_index=%s",
             self.model_path,
-            self.session.get_providers(),
+            self.active_providers,
             [(item.name, item.shape, item.type) for item in self.session.get_inputs()],
             [(item.name, item.shape, item.type) for item in self.session.get_outputs()],
             self.flow_output_index,
@@ -264,6 +296,199 @@ class OpticalFlowProcessor:
             np.arange(256, dtype=np.uint8).reshape(256, 1),
             cv2.COLORMAP_TURBO,
         ).reshape(256, 3)
+
+    def create_session_options(self):
+        session_options = ort.SessionOptions()
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return session_options
+
+    def resolve_execution_providers(self):
+        configured = os.getenv("OPTICAL_FLOW_ONNX_PROVIDERS")
+        if configured:
+            requested = [item.strip() for item in configured.split(",") if item.strip()]
+        elif self.env_bool("OPTICAL_FLOW_DISABLE_GPU", default=False):
+            requested = ["CPUExecutionProvider"]
+        else:
+            requested = [
+                provider
+                for provider in ("CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider")
+                if provider in self.available_providers
+            ]
+
+        providers = []
+        missing = []
+        for provider in requested:
+            if provider not in self.available_providers:
+                missing.append(provider)
+                continue
+            if provider == "CUDAExecutionProvider":
+                providers.append((provider, self.cuda_provider_options()))
+            else:
+                providers.append(provider)
+
+        if missing:
+            logger.warning(
+                "Requested ONNX providers are unavailable requested_missing=%s available_providers=%s",
+                missing,
+                self.available_providers,
+            )
+        if providers:
+            return providers
+        if "CPUExecutionProvider" in self.available_providers:
+            return ["CPUExecutionProvider"]
+        return None
+
+    def cuda_provider_options(self):
+        device_id = os.getenv("OPTICAL_FLOW_CUDA_DEVICE_ID", "0").strip()
+        try:
+            int(device_id)
+        except ValueError:
+            logger.warning("Invalid OPTICAL_FLOW_CUDA_DEVICE_ID=%s, using 0", device_id)
+            device_id = "0"
+        return {"device_id": device_id}
+
+    @staticmethod
+    def env_bool(name, default=False):
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def provider_names(providers):
+        if not providers:
+            return providers
+        names = []
+        for provider in providers:
+            if isinstance(provider, tuple):
+                names.append(provider[0])
+            else:
+                names.append(provider)
+        return names
+
+    def runtime_info(self):
+        return {
+            "onnxruntime_version": ort.__version__,
+            "available_providers": self.available_providers,
+            "active_providers": self.active_providers,
+            "execution_provider": self.execution_provider,
+            "gpu_enabled": self.execution_provider in ("CUDAExecutionProvider", "DmlExecutionProvider"),
+            "gpu_fallback_error": self.gpu_fallback_error,
+            "cuda_device_id": os.getenv("OPTICAL_FLOW_CUDA_DEVICE_ID", "0"),
+            "cuda_dll_dirs": self.cuda_dll_dirs,
+        }
+
+    def switch_to_cpu_provider(self, reason):
+        if "CPUExecutionProvider" not in self.available_providers:
+            return False
+        self.gpu_fallback_error = str(reason)
+        logger.warning("Switching ONNX session from CUDA to CPU after inference failure error=%s", reason)
+        self.session = ort.InferenceSession(
+            self.model_path,
+            sess_options=self.create_session_options(),
+            providers=["CPUExecutionProvider"],
+        )
+        self.active_providers = self.session.get_providers()
+        self.execution_provider = self.active_providers[0] if self.active_providers else "unknown"
+        self.flow_output_index = self.select_flow_output_index(self.session.get_outputs())
+        return True
+
+    def run_session_with_provider_fallback(self, feed):
+        try:
+            return self.session.run(None, feed)
+        except Exception as e:
+            if self.execution_provider in ("CUDAExecutionProvider", "DmlExecutionProvider") and self.switch_to_cpu_provider(e):
+                return self.session.run(None, feed)
+            raise
+
+    def preload_cuda_dlls_if_needed(self, providers):
+        provider_names = self.provider_names(providers) or []
+        if "CUDAExecutionProvider" not in provider_names:
+            return
+        self.add_cuda_dll_search_paths()
+        preload = getattr(ort, "preload_dlls", None)
+        if preload is None:
+            logger.debug("ONNX Runtime does not expose preload_dlls; skipping CUDA DLL preload")
+            return
+        try:
+            preload()
+            logger.info("Preloaded ONNX Runtime CUDA/cuDNN/MSVC DLL dependencies")
+        except Exception as e:
+            logger.warning("Failed to preload ONNX Runtime CUDA DLL dependencies error=%s", e)
+
+    def add_cuda_dll_search_paths(self):
+        directories = self.find_cuda_dll_directories()
+        if not directories:
+            logger.warning("No NVIDIA CUDA/cuDNN DLL directories found in Python site-packages or env")
+            return
+
+        existing_path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        existing_path_norm = {os.path.normcase(os.path.abspath(item)) for item in existing_path_parts if item}
+        path_updates = []
+
+        for directory in directories:
+            directory_text = str(directory)
+            directory_norm = os.path.normcase(os.path.abspath(directory_text))
+            if directory_norm not in existing_path_norm:
+                path_updates.append(directory_text)
+                existing_path_norm.add(directory_norm)
+            add_dll_directory = getattr(os, "add_dll_directory", None)
+            if add_dll_directory is not None:
+                try:
+                    self._cuda_dll_directory_handles.append(add_dll_directory(directory_text))
+                except OSError as e:
+                    logger.warning("Failed to add CUDA DLL directory path=%s error=%s", directory_text, e)
+
+        if path_updates:
+            os.environ["PATH"] = os.pathsep.join(path_updates + existing_path_parts)
+
+        self.cuda_dll_dirs = [str(directory) for directory in directories]
+        logger.info("Configured CUDA DLL search directories dirs=%s", self.cuda_dll_dirs)
+
+    def find_cuda_dll_directories(self):
+        candidates = []
+        configured = os.getenv("OPTICAL_FLOW_CUDA_DLL_DIRS")
+        if configured:
+            candidates.extend(Path(item.strip()) for item in configured.split(os.pathsep) if item.strip())
+
+        site_roots = []
+        try:
+            site_roots.extend(site.getsitepackages())
+        except Exception:
+            pass
+        try:
+            site_roots.append(site.getusersitepackages())
+        except Exception:
+            pass
+
+        preferred_packages = (
+            "cuda_runtime",
+            "cublas",
+            "cudnn",
+            "cuda_nvrtc",
+            "cufft",
+            "curand",
+            "nvjitlink",
+        )
+        for root in site_roots:
+            nvidia_root = Path(root) / "nvidia"
+            for package_name in preferred_packages:
+                candidates.append(nvidia_root / package_name / "bin")
+            candidates.extend(nvidia_root.glob("*/bin"))
+
+        seen = set()
+        directories = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            key = os.path.normcase(str(resolved))
+            if key in seen or not resolved.is_dir():
+                continue
+            seen.add(key)
+            directories.append(resolved)
+        return directories
 
     def select_flow_output_index(self, output_meta):
         best_index = len(output_meta) - 1 if output_meta else 0
@@ -396,7 +621,7 @@ class OpticalFlowProcessor:
                 for i, meta in enumerate(input_meta[:2]):
                     feed[meta.name] = prev_blob if i == 0 else curr_blob
 
-            outputs = self.session.run(None, feed)
+            outputs = self.run_session_with_provider_fallback(feed)
             if not outputs:
                 raise RuntimeError("model returned no outputs")
             return self.postprocess_flow(outputs)

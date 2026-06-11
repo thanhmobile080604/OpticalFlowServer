@@ -1,0 +1,9 @@
+# Recommended for Windows GPUs that do not work with the CUDA/cuDNN stack,
+# including NVIDIA Quadro P400/Pascal.
+fastapi==0.110.0
+uvicorn==0.27.1
+python-multipart==0.0.9
+onnxruntime-directml==1.24.4
+opencv-python==4.9.0.80
+numpy==1.26.4
+imageio-ffmpeg==0.5.1

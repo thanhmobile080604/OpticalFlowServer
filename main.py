@@ -1011,6 +1011,7 @@ def health_check():
     return {
         "status": "ok",
         "model_loaded": processor is not None,
+        "runtime": processor.runtime_info() if processor else None,
         "video_jobs": video_job_counts(),
         "video_uploads": video_upload_counts(),
     }

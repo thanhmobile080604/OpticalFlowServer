@@ -1,0 +1,9 @@
+# Best for newer NVIDIA GPUs. Includes CUDA/cuDNN runtime packages from PyPI.
+# Do not use this for Quadro P400/Pascal on Windows; use DirectML instead.
+fastapi==0.110.0
+uvicorn==0.27.1
+python-multipart==0.0.9
+onnxruntime-gpu[cuda,cudnn]==1.26.0
+opencv-python==4.9.0.80
+numpy==1.26.4
+imageio-ffmpeg==0.5.1
