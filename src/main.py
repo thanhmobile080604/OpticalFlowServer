@@ -15,7 +15,7 @@ import time
 import math
 from dataclasses import dataclass, asdict
 from typing import Optional
-from inference import NormalizedPoint, NormalizedRoi, OpticalFlowProcessor, ProcessingCancelled
+from src.inference import NormalizedPoint, NormalizedRoi, OpticalFlowProcessor, ProcessingCancelled
 
 LOG_LEVEL = os.getenv("OPTICAL_FLOW_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
