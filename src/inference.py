@@ -1,6 +1,12 @@
-import cv2
-import numpy as np
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+
+import cv2
+cv2.setNumThreads(max(1, int(os.getenv("OPTICAL_FLOW_OPENCV_THREADS", "1"))))
+import numpy as np
 import math
 import json
 import logging
@@ -38,6 +44,7 @@ class NormalizedRoi:
     bottom: float
     view_aspect_ratio: float
     path_points: list
+    selected_position_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -296,6 +303,10 @@ class OpticalFlowProcessor:
             np.arange(256, dtype=np.uint8).reshape(256, 1),
             cv2.COLORMAP_TURBO,
         ).reshape(256, 3)
+        self.sam2_predictor = None
+        self.sam2_device = None
+        self.sam2_checkpoint = Path(__file__).resolve().parents[1] / "AI_model" / "sam2.1_hiera_tiny.pt"
+        self.sam2_config = os.getenv("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_t.yaml")
 
     def create_session_options(self):
         session_options = ort.SessionOptions()
@@ -354,6 +365,9 @@ class OpticalFlowProcessor:
             return default
         return value.strip().lower() in ("1", "true", "yes", "on")
 
+    def should_force_cpu_for_roi(self):
+        return self.env_bool("OPTICAL_FLOW_ROI_FORCE_CPU", default=True)
+
     @staticmethod
     def provider_names(providers):
         if not providers:
@@ -376,6 +390,9 @@ class OpticalFlowProcessor:
             "gpu_fallback_error": self.gpu_fallback_error,
             "cuda_device_id": os.getenv("OPTICAL_FLOW_CUDA_DEVICE_ID", "0"),
             "cuda_dll_dirs": self.cuda_dll_dirs,
+            "sam2_checkpoint": str(self.sam2_checkpoint),
+            "sam2_checkpoint_exists": self.sam2_checkpoint.exists(),
+            "sam2_device": self.sam2_device,
         }
 
     def switch_to_cpu_provider(self, reason):
@@ -698,6 +715,284 @@ class OpticalFlowProcessor:
         cv2.fillPoly(mask, [np.asarray(polygon, dtype=np.int32)], 255)
         return mask
 
+    def selected_frame_index(self, roi: Optional[NormalizedRoi], fps: float, total_frames: int):
+        if roi is None:
+            return 0
+        selected_ms = max(0, int(getattr(roi, "selected_position_ms", 0) or 0))
+        frame_index = int(round((selected_ms / 1000.0) * max(float(fps), 1.0)))
+        if total_frames > 0:
+            frame_index = min(frame_index, total_frames - 1)
+        return max(0, frame_index)
+
+    def load_sam2_predictor(self):
+        if self.sam2_predictor is not None:
+            return self.sam2_predictor
+        if not self.sam2_checkpoint.exists():
+            raise RuntimeError(
+                f"SAM2 checkpoint missing: {self.sam2_checkpoint}. "
+                "Download sam2.1_hiera_tiny.pt into AI_model."
+            )
+        try:
+            import torch
+            from sam2.build_sam import build_sam2_video_predictor
+        except Exception as e:
+            raise RuntimeError(
+                "SAM2 dependencies are not installed. Install SAM-2, torch and torchvision."
+            ) from e
+        try:
+            torch.set_num_threads(max(1, int(os.getenv("SAM2_TORCH_THREADS", "2"))))
+            torch.set_num_interop_threads(max(1, int(os.getenv("SAM2_TORCH_INTEROP_THREADS", "1"))))
+        except RuntimeError as e:
+            logger.debug("Torch thread settings already initialized: %s", e)
+
+        device = os.getenv("SAM2_DEVICE", "").strip().lower()
+        if not device:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(
+            "Loading SAM2 video predictor config=%s checkpoint=%s device=%s",
+            self.sam2_config,
+            self.sam2_checkpoint,
+            device,
+        )
+        self.sam2_predictor = build_sam2_video_predictor(
+            self.sam2_config,
+            str(self.sam2_checkpoint),
+            device=device,
+        )
+        self.sam2_device = device
+        return self.sam2_predictor
+
+    def sam2_prompt_box(self, frame, roi: NormalizedRoi, job_id=None):
+        active = self.active_roi(frame, roi, job_id=job_id)
+        if active is None:
+            raise RuntimeError("ROI could not be mapped to a valid SAM2 prompt box.")
+        return np.asarray(
+            [
+                active.x,
+                active.y,
+                active.x + active.width,
+                active.y + active.height,
+            ],
+            dtype=np.float32,
+        )
+
+    def sam2_prompt_mask(self, frame, roi: NormalizedRoi, job_id=None):
+        active = self.active_roi(frame, roi, job_id=job_id)
+        if active is None or active.mask is None:
+            return None
+
+        prompt_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        prompt_mask[
+            active.y:active.y + active.height,
+            active.x:active.x + active.width,
+        ] = active.mask
+        return prompt_mask > 0
+
+    def clean_sam2_mask(self, mask, guide_mask=None):
+        if mask is None:
+            return None
+        if mask.ndim == 3:
+            mask = mask[0]
+
+        cleaned = (mask > 0).astype(np.uint8) * 255
+        if cleaned.size == 0:
+            return None
+
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+
+        guide = None
+        if guide_mask is not None:
+            if guide_mask.ndim == 3:
+                guide_mask = guide_mask[0]
+            guide = (guide_mask > 0).astype(np.uint8) * 255
+            if guide.shape != cleaned.shape:
+                guide = cv2.resize(guide, (cleaned.shape[1], cleaned.shape[0]), interpolation=cv2.INTER_NEAREST)
+            if cv2.countNonZero(guide) > 0:
+                dilation = max(3, int(os.getenv("SAM2_MASK_GUIDE_DILATION", "28")))
+                guide_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
+                guided = cv2.bitwise_and(cleaned, cv2.dilate(guide, guide_kernel))
+                if cv2.countNonZero(guided) > 0:
+                    cleaned = guided
+
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats((cleaned > 0).astype(np.uint8), 8)
+        if component_count <= 1:
+            return cleaned if cv2.countNonZero(cleaned) > 0 else None
+
+        best_label = None
+        best_score = None
+        for label in range(1, component_count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area <= 0:
+                continue
+            component = labels == label
+            overlap = 0
+            if guide is not None:
+                overlap = int(np.count_nonzero(component & (guide > 0)))
+            score = (overlap > 0, overlap, area)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_label = label
+
+        if best_label is None:
+            return None
+        return ((labels == best_label).astype(np.uint8) * 255)
+
+    def clean_sam2_masks(self, masks_by_frame, prompt_frame_idx, prompt_mask):
+        if not masks_by_frame:
+            return masks_by_frame
+
+        cleaned = {}
+        prompt_clean = self.clean_sam2_mask(masks_by_frame.get(prompt_frame_idx), prompt_mask)
+        if prompt_clean is None:
+            prompt_clean = (prompt_mask.astype(np.uint8) * 255) if prompt_mask is not None else None
+        if prompt_clean is not None:
+            cleaned[prompt_frame_idx] = prompt_clean
+
+        previous = prompt_clean
+        for frame_idx in sorted(idx for idx in masks_by_frame.keys() if idx > prompt_frame_idx):
+            current = self.clean_sam2_mask(masks_by_frame.get(frame_idx), previous)
+            if current is not None:
+                cleaned[frame_idx] = current
+                previous = current
+
+        previous = prompt_clean
+        for frame_idx in sorted((idx for idx in masks_by_frame.keys() if idx < prompt_frame_idx), reverse=True):
+            current = self.clean_sam2_mask(masks_by_frame.get(frame_idx), previous)
+            if current is not None:
+                cleaned[frame_idx] = current
+                previous = current
+
+        return cleaned
+
+    def sam2_segment_video(
+        self,
+        input_video_path,
+        first_frame,
+        roi: NormalizedRoi,
+        fps: float,
+        total_frames: int,
+        req_id=None,
+        progress_callback=None,
+        cancel_callback=None,
+    ):
+        try:
+            import torch
+        except Exception as e:
+            raise RuntimeError("PyTorch is required for SAM2 segmentation.") from e
+
+        def raise_if_cancelled():
+            if cancel_callback is not None and cancel_callback():
+                raise ProcessingCancelled(f"Video job cancelled job_id={req_id}")
+
+        predictor = self.load_sam2_predictor()
+        prompt_frame_idx = self.selected_frame_index(roi, fps, total_frames)
+        prompt_box = self.sam2_prompt_box(first_frame, roi, job_id=req_id)
+        prompt_mask = self.sam2_prompt_mask(first_frame, roi, job_id=req_id)
+        masks_by_frame = {}
+
+        logger.info(
+            "SAM2 segmentation starting job_id=%s video=%s prompt_frame=%s prompt_box=%s prompt_mask=%s total_frames=%s device=%s",
+            req_id,
+            input_video_path,
+            prompt_frame_idx,
+            [round(float(v), 2) for v in prompt_box.tolist()],
+            prompt_mask is not None,
+            total_frames,
+            self.sam2_device,
+        )
+        if progress_callback is not None:
+            progress_callback(1)
+        raise_if_cancelled()
+
+        with torch.inference_mode():
+            inference_state = predictor.init_state(
+                video_path=input_video_path,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=(self.sam2_device == "cpu"),
+            )
+            if prompt_mask is not None:
+                predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=prompt_frame_idx,
+                    obj_id=1,
+                    mask=prompt_mask,
+                )
+            else:
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=prompt_frame_idx,
+                    obj_id=1,
+                    box=prompt_box,
+                    normalize_coords=False,
+                )
+
+            passes = (
+                ("forward", False, prompt_frame_idx, 50),
+                ("reverse", True, prompt_frame_idx, 40),
+            )
+            for pass_name, reverse, start_frame_idx, progress_span in passes:
+                seen = 0
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=start_frame_idx,
+                    reverse=reverse,
+                ):
+                    raise_if_cancelled()
+                    if out_mask_logits is None or len(out_obj_ids) <= 0:
+                        continue
+                    mask_tensor = out_mask_logits[0] > 0.0
+                    mask = mask_tensor.detach().to("cpu").numpy().astype(np.uint8) * 255
+                    if mask.ndim == 3:
+                        mask = mask[0]
+                    masks_by_frame[int(out_frame_idx)] = mask
+                    seen += 1
+                    if progress_callback is not None and total_frames > 0 and seen % 5 == 0:
+                        base = 5 if not reverse else 55
+                        progress = base + min(progress_span, int((seen / total_frames) * progress_span))
+                        progress_callback(progress)
+                logger.info(
+                    "SAM2 propagation pass complete job_id=%s pass=%s masks=%s",
+                    req_id,
+                    pass_name,
+                    seen,
+                )
+
+        if not masks_by_frame:
+            raise RuntimeError("SAM2 did not produce any object masks.")
+        if prompt_mask is not None:
+            masks_by_frame = self.clean_sam2_masks(masks_by_frame, prompt_frame_idx, prompt_mask)
+            if not masks_by_frame:
+                raise RuntimeError("SAM2 masks were empty after ROI cleanup.")
+        logger.info(
+            "SAM2 segmentation finished job_id=%s mask_frames=%s total_frames=%s",
+            req_id,
+            len(masks_by_frame),
+            total_frames,
+        )
+        return masks_by_frame
+
+    def active_roi_from_mask(self, mask):
+        if mask is None:
+            return None
+        if mask.ndim == 3:
+            mask = mask[0]
+        mask = (mask > 0).astype(np.uint8) * 255
+        coords = cv2.findNonZero(mask)
+        if coords is None:
+            return None
+        x, y, width, height = cv2.boundingRect(coords)
+        if width < 2 or height < 2:
+            return None
+        return ActiveRoi(
+            x=int(x),
+            y=int(y),
+            width=int(width),
+            height=int(height),
+            mask=mask[y:y + height, x:x + width],
+        )
+
     def draw_flow_result(self, flow_output, frame, mode, vector_direction_sign, active_roi=None, job_id=None, frame_index=None):
         if active_roi is None:
             if mode == "HEATMAP":
@@ -952,6 +1247,12 @@ class OpticalFlowProcessor:
             self.flow_frame_offset,
             self.roi_summary(roi),
         )
+        if (
+            roi is not None
+            and self.execution_provider == "DmlExecutionProvider"
+            and self.should_force_cpu_for_roi()
+        ):
+            self.switch_to_cpu_provider("ROI/SAM2 jobs default to CPU to avoid DirectML iGPU stalls")
 
         status_path = None
         if req_id is not None:
@@ -1024,7 +1325,20 @@ class OpticalFlowProcessor:
             if width <= 0 or height <= 0:
                 raise Exception(f"Invalid frame dimensions width={width} height={height}")
 
-            active_roi = self.active_roi(first_frame, roi, job_id=req_id)
+            object_masks_by_frame = None
+            if roi is not None:
+                object_masks_by_frame = self.sam2_segment_video(
+                    input_video_path=input_video_path,
+                    first_frame=first_frame,
+                    roi=roi,
+                    fps=fps,
+                    total_frames=total_frames,
+                    req_id=req_id,
+                    progress_callback=lambda percent: report_progress(min(60, int(percent * 0.6))),
+                    cancel_callback=cancel_callback,
+                )
+
+            active_roi = None if object_masks_by_frame is not None else self.active_roi(first_frame, roi, job_id=req_id)
             out = H264Mp4Writer(output_video_path, fps, width, height, req_id=req_id).open()
 
             logger.info(
@@ -1050,6 +1364,15 @@ class OpticalFlowProcessor:
 
             frame_buffer = [first_frame]
 
+            def report_flow_progress(processed_frames):
+                if total_frames <= 0:
+                    return
+                raw_percent = (processed_frames / total_frames) * 100
+                if object_masks_by_frame is not None:
+                    report_progress(60 + int(raw_percent * 0.4))
+                else:
+                    report_progress(raw_percent)
+
             while True:
                 raise_if_cancelled()
                 ret, curr_frame = cap.read()
@@ -1067,14 +1390,25 @@ class OpticalFlowProcessor:
                 frame_index = frames_processed + 1
                 source_for_inference = source_frame
                 comparison_for_inference = comparison_frame
-                if active_roi is not None:
+                frame_active_roi = active_roi
+                if object_masks_by_frame is not None:
+                    frame_active_roi = self.active_roi_from_mask(object_masks_by_frame.get(frames_processed))
+                    if frame_active_roi is None:
+                        out.write(source_frame)
+                        frames_processed += 1
+                        frame_buffer.pop(0)
+                        if total_frames > 0 and frames_processed % 5 == 0:
+                            report_flow_progress(frames_processed)
+                        continue
+
+                if frame_active_roi is not None:
                     source_for_inference = source_frame[
-                        active_roi.y:active_roi.y + active_roi.height,
-                        active_roi.x:active_roi.x + active_roi.width,
+                        frame_active_roi.y:frame_active_roi.y + frame_active_roi.height,
+                        frame_active_roi.x:frame_active_roi.x + frame_active_roi.width,
                     ]
                     comparison_for_inference = comparison_frame[
-                        active_roi.y:active_roi.y + active_roi.height,
-                        active_roi.x:active_roi.x + active_roi.width,
+                        frame_active_roi.y:frame_active_roi.y + frame_active_roi.height,
+                        frame_active_roi.x:frame_active_roi.x + frame_active_roi.width,
                     ]
 
                 flow_output = None
@@ -1088,7 +1422,7 @@ class OpticalFlowProcessor:
                             req_id,
                             mode,
                             frame_index,
-                            active_roi is not None,
+                            frame_active_roi is not None,
                             self.summarize_flow(flow_output),
                         )
 
@@ -1097,7 +1431,7 @@ class OpticalFlowProcessor:
                         source_frame,
                         mode,
                         vector_direction_sign,
-                        active_roi=active_roi,
+                        active_roi=frame_active_roi,
                         job_id=req_id,
                         frame_index=frame_index,
                     )
@@ -1108,7 +1442,7 @@ class OpticalFlowProcessor:
                         req_id,
                         mode,
                         frame_index,
-                        active_roi is not None,
+                        frame_active_roi is not None,
                         getattr(source_for_inference, "shape", None),
                         getattr(comparison_for_inference, "shape", None),
                         flow_summary,
@@ -1121,14 +1455,14 @@ class OpticalFlowProcessor:
                 frame_buffer.pop(0)
                 # update status every 5 frames
                 if total_frames > 0 and frames_processed % 5 == 0:
-                    report_progress((frames_processed / total_frames) * 100)
+                    report_flow_progress(frames_processed)
 
             while frame_buffer:
                 raise_if_cancelled()
                 out.write(frame_buffer.pop(0))
                 frames_processed += 1
                 if total_frames > 0 and frames_processed % 5 == 0:
-                    report_progress((frames_processed / total_frames) * 100)
+                    report_flow_progress(frames_processed)
 
             out.release()
             out = None

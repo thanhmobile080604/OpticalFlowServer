@@ -1,3 +1,4 @@
 /temp_videos/
 uvicorn.*.log
 *.pyc
+*.pt

@@ -100,7 +100,7 @@ opticalFlowServerBaseUrl=https://your-tunnel-url.trycloudflare.com
 Optional environment variables:
 
 ```powershell
-$env:OPTICAL_FLOW_MAX_CONCURRENT_VIDEO_JOBS = "3"
+$env:OPTICAL_FLOW_MAX_CONCURRENT_VIDEO_JOBS = "1"
 $env:OPTICAL_FLOW_MAX_PENDING_VIDEO_JOBS = "8"
 ```
 
@@ -109,4 +109,32 @@ For manual provider override:
 ```powershell
 $env:OPTICAL_FLOW_ONNX_PROVIDERS = "DmlExecutionProvider,CPUExecutionProvider"
 $env:OPTICAL_FLOW_ONNX_PROVIDERS = "CUDAExecutionProvider,CPUExecutionProvider"
+```
+
+For Intel Iris Xe or other laptop iGPUs, ROI/SAM2 jobs can make DirectML stall the
+desktop. The server defaults ROI jobs to CPU for stability. Keep this setting
+unless you have a discrete GPU:
+
+```powershell
+$env:OPTICAL_FLOW_ROI_FORCE_CPU = "true"
+$env:SAM2_TORCH_THREADS = "2"
+$env:OPTICAL_FLOW_OPENCV_THREADS = "1"
+```
+
+## SAM2 Object ROI
+
+Video jobs with an ROI use SAM2 to propagate the selected object mask across the
+uploaded video. Optical-flow vectors/heatmap are then drawn only inside the SAM2
+mask for that selected object.
+
+The default test checkpoint is:
+
+```text
+AI_model\sam2.1_hiera_tiny.pt
+```
+
+Download it with:
+
+```powershell
+Invoke-WebRequest -Uri "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt" -OutFile "AI_model\sam2.1_hiera_tiny.pt"
 ```

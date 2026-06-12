@@ -88,7 +88,7 @@ class VideoUpload:
 
 video_jobs = {}
 video_jobs_lock = threading.Lock()
-MAX_CONCURRENT_VIDEO_JOBS = max(1, int(os.getenv("OPTICAL_FLOW_MAX_CONCURRENT_VIDEO_JOBS", "3")))
+MAX_CONCURRENT_VIDEO_JOBS = max(1, int(os.getenv("OPTICAL_FLOW_MAX_CONCURRENT_VIDEO_JOBS", "1")))
 MAX_PENDING_VIDEO_JOBS = max(
     MAX_CONCURRENT_VIDEO_JOBS,
     int(os.getenv("OPTICAL_FLOW_MAX_PENDING_VIDEO_JOBS", "8")),
@@ -406,6 +406,7 @@ def resolve_roi(
     roi_bottom: Optional[float],
     roi_view_aspect_ratio: Optional[float],
     roi_path_points: Optional[str],
+    roi_selected_position_ms: Optional[int] = None,
 ) -> Optional[NormalizedRoi]:
     if roi_enabled is False:
         return None
@@ -442,6 +443,7 @@ def resolve_roi(
         bottom=bottom,
         view_aspect_ratio=view_aspect_ratio,
         path_points=parse_roi_path_points(roi_path_points),
+        selected_position_ms=max(0, int(roi_selected_position_ms or 0)),
     )
 
 
@@ -455,6 +457,7 @@ def roi_log_payload(roi: Optional[NormalizedRoi]):
         "bottom": round(roi.bottom, 4),
         "view_aspect_ratio": round(roi.view_aspect_ratio, 4),
         "path_points": len(roi.path_points),
+        "selected_position_ms": getattr(roi, "selected_position_ms", 0),
     }
 
 
@@ -560,6 +563,7 @@ async def process_video(
     roi_bottom: Optional[float] = Form(None),
     roi_view_aspect_ratio: Optional[float] = Form(None),
     roi_path_points: Optional[str] = Form(None),
+    roi_selected_position_ms: Optional[int] = Form(None),
 ):
     """
     Process a video using the RAFT Optical Flow model.
@@ -578,6 +582,7 @@ async def process_video(
         roi_bottom,
         roi_view_aspect_ratio,
         roi_path_points,
+        roi_selected_position_ms,
     )
 
     # Save uploaded video to system temporary files
@@ -644,6 +649,7 @@ async def create_process_video_job(
     roi_bottom: Optional[float] = Form(None),
     roi_view_aspect_ratio: Optional[float] = Form(None),
     roi_path_points: Optional[str] = Form(None),
+    roi_selected_position_ms: Optional[int] = Form(None),
 ):
     """
     Create an async video-processing job for Cloudflare Tunnel clients.
@@ -663,6 +669,7 @@ async def create_process_video_job(
         roi_bottom,
         roi_view_aspect_ratio,
         roi_path_points,
+        roi_selected_position_ms,
     )
 
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
@@ -828,6 +835,7 @@ def complete_process_video_upload(
     roi_bottom: Optional[float] = Form(None),
     roi_view_aspect_ratio: Optional[float] = Form(None),
     roi_path_points: Optional[str] = Form(None),
+    roi_selected_position_ms: Optional[int] = Form(None),
 ):
     if not processor:
         logger.error("Chunked process-video job rejected because model is not loaded upload_id=%s", upload_id)
@@ -852,6 +860,7 @@ def complete_process_video_upload(
         roi_bottom,
         roi_view_aspect_ratio,
         roi_path_points,
+        roi_selected_position_ms,
     )
 
     input_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
