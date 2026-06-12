@@ -1,4 +1,5 @@
 /temp_videos/
+__pycache__/
 uvicorn.*.log
 *.pyc
 *.pt
