@@ -319,8 +319,8 @@ class OpticalFlowProcessor:
         self.cutie_repo_path = os.getenv("CUTIE_REPO_PATH", "").strip()
         self.cutie_weights = os.getenv("CUTIE_WEIGHTS", "").strip()
         self.cutie_device_preference = os.getenv("CUTIE_DEVICE", "auto").strip().lower()
-        self.cutie_max_internal_size = int(os.getenv("CUTIE_MAX_INTERNAL_SIZE", "720"))
-        self.cutie_mem_every = max(1, int(os.getenv("CUTIE_MEM_EVERY", "5")))
+        self.cutie_max_internal_size = int(os.getenv("CUTIE_MAX_INTERNAL_SIZE", "1080"))
+        self.cutie_mem_every = max(1, int(os.getenv("CUTIE_MEM_EVERY", "3")))
         self.cutie_auto_download = self.env_bool("CUTIE_AUTO_DOWNLOAD", default=True)
 
     def create_session_options(self):

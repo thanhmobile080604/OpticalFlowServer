@@ -145,8 +145,8 @@ Useful Cutie settings:
 $env:ROI_SEGMENTATION_BACKEND = "cutie"
 $env:CUTIE_WEIGHTS = "third_party\Cutie\weights\cutie-base-mega.pth"
 $env:CUTIE_DEVICE = "cpu"
-$env:CUTIE_MAX_INTERNAL_SIZE = "720"
-$env:CUTIE_MEM_EVERY = "5"
+$env:CUTIE_MAX_INTERNAL_SIZE = "1080"
+$env:CUTIE_MEM_EVERY = "3"
 ```
 
 Use `CUTIE_DEVICE=cuda` only when PyTorch CUDA is available. On machines without
