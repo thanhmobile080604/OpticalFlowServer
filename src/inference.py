@@ -1,4 +1,4 @@
-import os
+﻿import os
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
@@ -277,9 +277,11 @@ class OpticalFlowProcessor:
             self.flow_output_index,
         )
         
-        self.input_width = 480
-        self.input_height = 360
-        self.flow_frame_offset = 3
+        self.input_width = max(64, int(os.getenv("OPTICAL_FLOW_INPUT_WIDTH", "480")))
+        self.input_height = max(64, int(os.getenv("OPTICAL_FLOW_INPUT_HEIGHT", "360")))
+        self.flow_frame_offset = max(1, int(os.getenv("OPTICAL_FLOW_FRAME_OFFSET", "3")))
+        self.roi_flow_frame_offset = max(1, int(os.getenv("OPTICAL_FLOW_ROI_FRAME_OFFSET", "2")))
+        self.roi_min_motion_magnitude = max(0.0, float(os.getenv("OPTICAL_FLOW_ROI_MIN_MOTION", "0.05")))
         
         # Drawing parameters
         self.draw_step = 34
@@ -303,10 +305,23 @@ class OpticalFlowProcessor:
             np.arange(256, dtype=np.uint8).reshape(256, 1),
             cv2.COLORMAP_TURBO,
         ).reshape(256, 3)
-        self.sam2_predictor = None
-        self.sam2_device = None
-        self.sam2_checkpoint = Path(__file__).resolve().parents[1] / "AI_model" / "sam2.1_hiera_tiny.pt"
-        self.sam2_config = os.getenv("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_t.yaml")
+        self.cutie_model = None
+        self.cutie_cfg = None
+        self.cutie_device = None
+        self.roi_segmentation_backend = os.getenv("ROI_SEGMENTATION_BACKEND", "cutie").strip().lower()
+        if self.roi_segmentation_backend not in ("static", "cutie"):
+            logger.warning(
+                "Unsupported ROI_SEGMENTATION_BACKEND=%s; falling back to static ROI",
+                self.roi_segmentation_backend,
+            )
+            self.roi_segmentation_backend = "static"
+        self.roi_fallback_to_static = self.env_bool("ROI_FALLBACK_TO_STATIC", default=False)
+        self.cutie_repo_path = os.getenv("CUTIE_REPO_PATH", "").strip()
+        self.cutie_weights = os.getenv("CUTIE_WEIGHTS", "").strip()
+        self.cutie_device_preference = os.getenv("CUTIE_DEVICE", "auto").strip().lower()
+        self.cutie_max_internal_size = int(os.getenv("CUTIE_MAX_INTERNAL_SIZE", "720"))
+        self.cutie_mem_every = max(1, int(os.getenv("CUTIE_MEM_EVERY", "5")))
+        self.cutie_auto_download = self.env_bool("CUTIE_AUTO_DOWNLOAD", default=True)
 
     def create_session_options(self):
         session_options = ort.SessionOptions()
@@ -390,9 +405,18 @@ class OpticalFlowProcessor:
             "gpu_fallback_error": self.gpu_fallback_error,
             "cuda_device_id": os.getenv("OPTICAL_FLOW_CUDA_DEVICE_ID", "0"),
             "cuda_dll_dirs": self.cuda_dll_dirs,
-            "sam2_checkpoint": str(self.sam2_checkpoint),
-            "sam2_checkpoint_exists": self.sam2_checkpoint.exists(),
-            "sam2_device": self.sam2_device,
+            "roi_segmentation_backend": self.roi_segmentation_backend,
+            "roi_fallback_to_static": self.roi_fallback_to_static,
+            "cutie_repo_path": self.cutie_repo_path,
+            "cutie_weights": self.cutie_weights,
+            "cutie_device": self.cutie_device,
+            "cutie_device_preference": self.cutie_device_preference,
+            "cutie_max_internal_size": self.cutie_max_internal_size,
+            "cutie_mem_every": self.cutie_mem_every,
+            "flow_input_size": [self.input_width, self.input_height],
+            "flow_frame_offset": self.flow_frame_offset,
+            "roi_flow_frame_offset": self.roi_flow_frame_offset,
+            "roi_min_motion_magnitude": self.roi_min_motion_magnitude,
         }
 
     def switch_to_cpu_provider(self, reason):
@@ -724,149 +748,146 @@ class OpticalFlowProcessor:
             frame_index = min(frame_index, total_frames - 1)
         return max(0, frame_index)
 
-    def load_sam2_predictor(self):
-        if self.sam2_predictor is not None:
-            return self.sam2_predictor
-        if not self.sam2_checkpoint.exists():
-            raise RuntimeError(
-                f"SAM2 checkpoint missing: {self.sam2_checkpoint}. "
-                "Download sam2.1_hiera_tiny.pt into AI_model."
-            )
-        try:
-            import torch
-            from sam2.build_sam import build_sam2_video_predictor
-        except Exception as e:
-            raise RuntimeError(
-                "SAM2 dependencies are not installed. Install SAM-2, torch and torchvision."
-            ) from e
-        try:
-            torch.set_num_threads(max(1, int(os.getenv("SAM2_TORCH_THREADS", "2"))))
-            torch.set_num_interop_threads(max(1, int(os.getenv("SAM2_TORCH_INTEROP_THREADS", "1"))))
-        except RuntimeError as e:
-            logger.debug("Torch thread settings already initialized: %s", e)
-
-        device = os.getenv("SAM2_DEVICE", "").strip().lower()
-        if not device:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(
-            "Loading SAM2 video predictor config=%s checkpoint=%s device=%s",
-            self.sam2_config,
-            self.sam2_checkpoint,
-            device,
-        )
-        self.sam2_predictor = build_sam2_video_predictor(
-            self.sam2_config,
-            str(self.sam2_checkpoint),
-            device=device,
-        )
-        self.sam2_device = device
-        return self.sam2_predictor
-
-    def sam2_prompt_box(self, frame, roi: NormalizedRoi, job_id=None):
+    def roi_index_mask(self, frame, roi: NormalizedRoi, job_id=None):
         active = self.active_roi(frame, roi, job_id=job_id)
         if active is None:
-            raise RuntimeError("ROI could not be mapped to a valid SAM2 prompt box.")
-        return np.asarray(
-            [
-                active.x,
-                active.y,
-                active.x + active.width,
-                active.y + active.height,
-            ],
-            dtype=np.float32,
+            raise RuntimeError("ROI could not be mapped to a valid Cutie prompt mask.")
+
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        if active.mask is None:
+            mask[
+                active.y:active.y + active.height,
+                active.x:active.x + active.width,
+            ] = 1
+        else:
+            mask[
+                active.y:active.y + active.height,
+                active.x:active.x + active.width,
+            ] = (active.mask > 0).astype(np.uint8)
+        return mask
+
+    def cutie_frame_to_torch(self, frame, device):
+        import torch
+
+        # Match Cutie's process_video.py: OpenCV BGR array, CHW float in [0, 1].
+        frame = np.ascontiguousarray(frame.transpose(2, 0, 1))
+        return torch.from_numpy(frame).float().to(device, non_blocking=True) / 255.0
+
+    def resolve_cutie_device(self, torch):
+        requested = self.cutie_device_preference
+        if requested in ("", "auto"):
+            if torch.cuda.is_available():
+                return "cuda"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
+        if requested == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUTIE_DEVICE=cuda requested but CUDA is unavailable; using CPU")
+            return "cpu"
+        if requested == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            logger.warning("CUTIE_DEVICE=mps requested but MPS is unavailable; using CPU")
+            return "cpu"
+        return requested
+
+    def load_cutie_model(self):
+        if self.cutie_model is not None:
+            return self.cutie_model, self.cutie_cfg, self.cutie_device
+
+        import sys
+        repo_root = Path(__file__).resolve().parents[1]
+        vendor_cutie_root = repo_root / "third_party" / "Cutie"
+        configured_cutie_root = Path(self.cutie_repo_path).resolve() if self.cutie_repo_path else None
+        preferred_cutie_root = configured_cutie_root or (vendor_cutie_root if vendor_cutie_root.exists() else None)
+        if preferred_cutie_root is not None:
+            cutie_repo = str(preferred_cutie_root)
+            if cutie_repo not in sys.path:
+                sys.path.insert(0, cutie_repo)
+
+        try:
+            import torch
+            import cutie.config as cutie_config
+            from hydra import compose, initialize_config_dir
+            from hydra.core.global_hydra import GlobalHydra
+            from omegaconf import open_dict
+            from cutie.model.cutie import CUTIE
+        except Exception as e:
+            raise RuntimeError(
+                "Cutie is required for ROI segmentation. Install it with: "
+                "git clone https://github.com/hkchengrex/Cutie.git && cd Cutie && pip install -e ."
+            ) from e
+
+        cutie_root = preferred_cutie_root or Path(cutie_config.__file__).resolve().parents[2]
+        config_dir = cutie_root / "cutie" / "config"
+        if not config_dir.exists():
+            raise RuntimeError(
+                f"Cutie config directory not found: {config_dir}. Set CUTIE_REPO_PATH to the Cutie checkout."
+            )
+
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(version_base="1.3.2", config_dir=str(config_dir), job_name="optical_flow_cutie"):
+            cfg = compose(config_name="video_config")
+
+        weights_path = self.cutie_weights
+        if not weights_path:
+            if self.cutie_auto_download:
+                from cutie.utils.download_models import download_models_if_needed
+                weights_path = str(Path(download_models_if_needed()) / "cutie-base-mega.pth")
+            else:
+                weights_path = str(cutie_root / "weights" / "cutie-base-mega.pth")
+        if not Path(weights_path).exists():
+            raise RuntimeError(
+                f"Cutie weights not found: {weights_path}. Run python cutie/utils/download_models.py "
+                "in the Cutie repo or set CUTIE_WEIGHTS."
+            )
+
+        device = self.resolve_cutie_device(torch)
+        with open_dict(cfg):
+            cfg["weights"] = weights_path
+            cfg["device"] = device
+            cfg["max_internal_size"] = self.cutie_max_internal_size
+            cfg["mem_every"] = self.cutie_mem_every
+
+        logger.info(
+            "Loading Cutie model device=%s weights=%s max_internal_size=%s mem_every=%s",
+            device,
+            weights_path,
+            self.cutie_max_internal_size,
+            self.cutie_mem_every,
         )
+        model = CUTIE(cfg).to(device).eval()
+        model_weights = torch.load(weights_path, map_location=device)
+        model.load_weights(model_weights)
 
-    def sam2_prompt_mask(self, frame, roi: NormalizedRoi, job_id=None):
-        active = self.active_roi(frame, roi, job_id=job_id)
-        if active is None or active.mask is None:
-            return None
+        self.cutie_model = model
+        self.cutie_cfg = cfg
+        self.cutie_device = device
+        return self.cutie_model, self.cutie_cfg, self.cutie_device
 
-        prompt_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        prompt_mask[
-            active.y:active.y + active.height,
-            active.x:active.x + active.width,
-        ] = active.mask
-        return prompt_mask > 0
+    def read_video_frames(self, input_video_path, first_frame=None, total_frames=0, req_id=None, cancel_callback=None):
+        frames = []
+        if first_frame is not None:
+            frames.append(first_frame)
 
-    def clean_sam2_mask(self, mask, guide_mask=None):
-        if mask is None:
-            return None
-        if mask.ndim == 3:
-            mask = mask[0]
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video for Cutie segmentation: {input_video_path}")
+        try:
+            if first_frame is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
+            while True:
+                if cancel_callback is not None and cancel_callback():
+                    raise ProcessingCancelled(f"Video job cancelled job_id={req_id}")
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(frame)
+                if total_frames > 0 and len(frames) >= total_frames:
+                    break
+        finally:
+            cap.release()
+        return frames
 
-        cleaned = (mask > 0).astype(np.uint8) * 255
-        if cleaned.size == 0:
-            return None
-
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-
-        guide = None
-        if guide_mask is not None:
-            if guide_mask.ndim == 3:
-                guide_mask = guide_mask[0]
-            guide = (guide_mask > 0).astype(np.uint8) * 255
-            if guide.shape != cleaned.shape:
-                guide = cv2.resize(guide, (cleaned.shape[1], cleaned.shape[0]), interpolation=cv2.INTER_NEAREST)
-            if cv2.countNonZero(guide) > 0:
-                dilation = max(3, int(os.getenv("SAM2_MASK_GUIDE_DILATION", "28")))
-                guide_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
-                guided = cv2.bitwise_and(cleaned, cv2.dilate(guide, guide_kernel))
-                if cv2.countNonZero(guided) > 0:
-                    cleaned = guided
-
-        component_count, labels, stats, _ = cv2.connectedComponentsWithStats((cleaned > 0).astype(np.uint8), 8)
-        if component_count <= 1:
-            return cleaned if cv2.countNonZero(cleaned) > 0 else None
-
-        best_label = None
-        best_score = None
-        for label in range(1, component_count):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if area <= 0:
-                continue
-            component = labels == label
-            overlap = 0
-            if guide is not None:
-                overlap = int(np.count_nonzero(component & (guide > 0)))
-            score = (overlap > 0, overlap, area)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_label = label
-
-        if best_label is None:
-            return None
-        return ((labels == best_label).astype(np.uint8) * 255)
-
-    def clean_sam2_masks(self, masks_by_frame, prompt_frame_idx, prompt_mask):
-        if not masks_by_frame:
-            return masks_by_frame
-
-        cleaned = {}
-        prompt_clean = self.clean_sam2_mask(masks_by_frame.get(prompt_frame_idx), prompt_mask)
-        if prompt_clean is None:
-            prompt_clean = (prompt_mask.astype(np.uint8) * 255) if prompt_mask is not None else None
-        if prompt_clean is not None:
-            cleaned[prompt_frame_idx] = prompt_clean
-
-        previous = prompt_clean
-        for frame_idx in sorted(idx for idx in masks_by_frame.keys() if idx > prompt_frame_idx):
-            current = self.clean_sam2_mask(masks_by_frame.get(frame_idx), previous)
-            if current is not None:
-                cleaned[frame_idx] = current
-                previous = current
-
-        previous = prompt_clean
-        for frame_idx in sorted((idx for idx in masks_by_frame.keys() if idx < prompt_frame_idx), reverse=True):
-            current = self.clean_sam2_mask(masks_by_frame.get(frame_idx), previous)
-            if current is not None:
-                cleaned[frame_idx] = current
-                previous = current
-
-        return cleaned
-
-    def sam2_segment_video(
+    def cutie_segment_video(
         self,
         input_video_path,
         first_frame,
@@ -877,109 +898,148 @@ class OpticalFlowProcessor:
         progress_callback=None,
         cancel_callback=None,
     ):
-        try:
-            import torch
-        except Exception as e:
-            raise RuntimeError("PyTorch is required for SAM2 segmentation.") from e
+        import torch
 
         def raise_if_cancelled():
             if cancel_callback is not None and cancel_callback():
                 raise ProcessingCancelled(f"Video job cancelled job_id={req_id}")
 
-        predictor = self.load_sam2_predictor()
         prompt_frame_idx = self.selected_frame_index(roi, fps, total_frames)
-        prompt_box = self.sam2_prompt_box(first_frame, roi, job_id=req_id)
-        prompt_mask = self.sam2_prompt_mask(first_frame, roi, job_id=req_id)
+        frames = self.read_video_frames(
+            input_video_path,
+            first_frame=first_frame,
+            total_frames=total_frames,
+            req_id=req_id,
+            cancel_callback=cancel_callback,
+        )
+        if not frames:
+            raise RuntimeError("Cutie could not read any video frames.")
+        prompt_frame_idx = min(prompt_frame_idx, len(frames) - 1)
+        prompt_mask = self.roi_index_mask(frames[prompt_frame_idx], roi, job_id=req_id)
+        if cv2.countNonZero(prompt_mask) <= 0:
+            raise RuntimeError("Cutie prompt mask is empty.")
+
+        model, cfg, device = self.load_cutie_model()
+        from cutie.inference.inference_core import InferenceCore
+        use_amp = bool(getattr(cfg, "amp", True)) and device == "cuda"
         masks_by_frame = {}
 
+        def run_sequence(frame_indices, progress_base, progress_span):
+            processor = InferenceCore(model, cfg=cfg)
+            processor.max_internal_size = self.cutie_max_internal_size
+            for step_idx, frame_idx in enumerate(frame_indices):
+                raise_if_cancelled()
+                frame_t = self.cutie_frame_to_torch(frames[frame_idx], device)
+                if step_idx == 0:
+                    mask_t = torch.from_numpy(prompt_mask.astype(np.int64)).to(device)
+                    prob = processor.step(frame_t, mask_t, objects=[1], force_permanent=True)
+                else:
+                    prob = processor.step(frame_t)
+                out_mask = processor.output_prob_to_mask(prob).detach().to("cpu").numpy().astype(np.uint8)
+                masks_by_frame[int(frame_idx)] = (out_mask == 1).astype(np.uint8) * 255
+                if progress_callback is not None and len(frame_indices) > 0:
+                    progress = progress_base + int(((step_idx + 1) / len(frame_indices)) * progress_span)
+                    progress_callback(min(100, progress))
+
         logger.info(
-            "SAM2 segmentation starting job_id=%s video=%s prompt_frame=%s prompt_box=%s prompt_mask=%s total_frames=%s device=%s",
+            "Cutie segmentation starting job_id=%s prompt_frame=%s prompt_mask_area=%s frames=%s device=%s",
             req_id,
-            input_video_path,
             prompt_frame_idx,
-            [round(float(v), 2) for v in prompt_box.tolist()],
-            prompt_mask is not None,
-            total_frames,
-            self.sam2_device,
+            cv2.countNonZero(prompt_mask),
+            len(frames),
+            device,
         )
-        if progress_callback is not None:
-            progress_callback(1)
-        raise_if_cancelled()
-
         with torch.inference_mode():
-            inference_state = predictor.init_state(
-                video_path=input_video_path,
-                offload_video_to_cpu=True,
-                offload_state_to_cpu=(self.sam2_device == "cpu"),
-            )
-            if prompt_mask is not None:
-                predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=prompt_frame_idx,
-                    obj_id=1,
-                    mask=prompt_mask,
-                )
-            else:
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=prompt_frame_idx,
-                    obj_id=1,
-                    box=prompt_box,
-                    normalize_coords=False,
-                )
-
-            passes = (
-                ("forward", False, prompt_frame_idx, 50),
-                ("reverse", True, prompt_frame_idx, 40),
-            )
-            for pass_name, reverse, start_frame_idx, progress_span in passes:
-                seen = 0
-                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-                    inference_state,
-                    start_frame_idx=start_frame_idx,
-                    reverse=reverse,
-                ):
-                    raise_if_cancelled()
-                    if out_mask_logits is None or len(out_obj_ids) <= 0:
-                        continue
-                    mask_tensor = out_mask_logits[0] > 0.0
-                    mask = mask_tensor.detach().to("cpu").numpy().astype(np.uint8) * 255
-                    if mask.ndim == 3:
-                        mask = mask[0]
-                    masks_by_frame[int(out_frame_idx)] = mask
-                    seen += 1
-                    if progress_callback is not None and total_frames > 0 and seen % 5 == 0:
-                        base = 5 if not reverse else 55
-                        progress = base + min(progress_span, int((seen / total_frames) * progress_span))
-                        progress_callback(progress)
-                logger.info(
-                    "SAM2 propagation pass complete job_id=%s pass=%s masks=%s",
-                    req_id,
-                    pass_name,
-                    seen,
-                )
+            with torch.amp.autocast(device, enabled=use_amp):
+                run_sequence(range(prompt_frame_idx, len(frames)), 1, 54)
+                if prompt_frame_idx > 0:
+                    run_sequence(range(prompt_frame_idx, -1, -1), 55, 44)
 
         if not masks_by_frame:
-            raise RuntimeError("SAM2 did not produce any object masks.")
-        if prompt_mask is not None:
-            masks_by_frame = self.clean_sam2_masks(masks_by_frame, prompt_frame_idx, prompt_mask)
-            if not masks_by_frame:
-                raise RuntimeError("SAM2 masks were empty after ROI cleanup.")
+            raise RuntimeError("Cutie did not produce any object masks.")
         logger.info(
-            "SAM2 segmentation finished job_id=%s mask_frames=%s total_frames=%s",
+            "Cutie segmentation finished job_id=%s mask_frames=%s total_frames=%s motion=%s",
             req_id,
             len(masks_by_frame),
             total_frames,
+            self.mask_motion_summary(masks_by_frame),
         )
         return masks_by_frame
 
-    def active_roi_from_mask(self, mask):
+    def points_hit_mask(mask, points):
+        if mask is None or points is None:
+            return 0
+        if mask.ndim == 3:
+            mask = mask[0]
+        height, width = mask.shape[:2]
+        hits = 0
+        for point_x, point_y in np.asarray(points):
+            x = int(round(float(point_x)))
+            y = int(round(float(point_y)))
+            if 0 <= x < width and 0 <= y < height and mask[y, x] > 0:
+                hits += 1
+        return hits
+
+    def mask_for_frame(self, masks_by_frame, frame_idx):
+        if not masks_by_frame:
+            return None
+        if frame_idx in masks_by_frame:
+            return masks_by_frame[frame_idx]
+        nearest_idx = min(masks_by_frame.keys(), key=lambda existing_idx: (abs(int(existing_idx) - int(frame_idx)), int(existing_idx)))
+        return masks_by_frame.get(nearest_idx)
+
+    def mask_motion_summary(self, masks_by_frame):
+        if not masks_by_frame:
+            return None
+        centers = []
+        areas = []
+        for frame_idx in sorted(masks_by_frame.keys()):
+            mask = masks_by_frame.get(frame_idx)
+            if mask is None:
+                continue
+            if mask.ndim == 3:
+                mask = mask[0]
+            mask = (mask > 0).astype(np.uint8) * 255
+            moments = cv2.moments(mask)
+            area = float(moments["m00"])
+            if area <= 0:
+                continue
+            centers.append((float(moments["m10"] / area), float(moments["m01"] / area)))
+            areas.append(cv2.countNonZero(mask))
+        if not centers:
+            return None
+        xs = [item[0] for item in centers]
+        ys = [item[1] for item in centers]
+        return {
+            "frames": len(centers),
+            "x_span": round(max(xs) - min(xs), 2),
+            "y_span": round(max(ys) - min(ys), 2),
+            "area_min": int(min(areas)),
+            "area_max": int(max(areas)),
+        }
+
+    def active_roi_from_mask(self, mask, extra_masks=None):
         if mask is None:
             return None
         if mask.ndim == 3:
             mask = mask[0]
         mask = (mask > 0).astype(np.uint8) * 255
-        coords = cv2.findNonZero(mask)
+        box_mask = mask
+        for extra_mask in extra_masks or []:
+            if extra_mask is None:
+                continue
+            if extra_mask.ndim == 3:
+                extra_mask = extra_mask[0]
+            extra_mask = (extra_mask > 0).astype(np.uint8) * 255
+            if extra_mask.shape != box_mask.shape:
+                extra_mask = cv2.resize(
+                    extra_mask,
+                    (box_mask.shape[1], box_mask.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            box_mask = cv2.bitwise_or(box_mask, extra_mask)
+
+        coords = cv2.findNonZero(box_mask)
         if coords is None:
             return None
         x, y, width, height = cv2.boundingRect(coords)
@@ -1004,7 +1064,13 @@ class OpticalFlowProcessor:
             active_roi.x:active_roi.x + active_roi.width,
         ]
         if mode == "HEATMAP":
-            result_roi = self.draw_heatmap(flow_output, roi_view, job_id=job_id, frame_index=frame_index)
+            result_roi = self.draw_heatmap(
+                flow_output,
+                roi_view,
+                job_id=job_id,
+                frame_index=frame_index,
+                min_motion_magnitude=self.roi_min_motion_magnitude,
+            )
         else:
             result_roi = self.draw_vectors(flow_output, roi_view, vector_direction_sign, job_id=job_id, frame_index=frame_index)
 
@@ -1026,7 +1092,7 @@ class OpticalFlowProcessor:
             "path_points": len(getattr(roi, "path_points", None) or []),
         }
 
-    def draw_heatmap(self, flow, frame, job_id=None, frame_index=None):
+    def draw_heatmap(self, flow, frame, job_id=None, frame_index=None, min_motion_magnitude=None):
         channels = self.extract_flow_channels(flow, "heatmap", job_id=job_id, frame_index=frame_index)
         if channels is None:
             return frame
@@ -1043,12 +1109,17 @@ class OpticalFlowProcessor:
         magnitude = np.sqrt(fx**2 + fy**2).astype(np.float32)
         magnitude = cv2.GaussianBlur(magnitude, (0, 0), 1.35)
 
-        active = magnitude[magnitude > self.min_motion_magnitude]
+        motion_min = self.min_motion_magnitude if min_motion_magnitude is None else float(min_motion_magnitude)
+        active = magnitude[magnitude > motion_min]
+        if active.size == 0 and min_motion_magnitude is not None:
+            fallback_floor = max(1e-4, float(np.percentile(magnitude, 65.0)) * 0.35)
+            active = magnitude[magnitude > fallback_floor]
+            motion_min = fallback_floor
         if active.size == 0:
             return frame
 
         motion_floor = max(
-            self.min_motion_magnitude,
+            motion_min,
             float(np.percentile(active, self.heatmap_floor_percentile)) * 0.75,
         )
         motion_peak = float(np.percentile(active, self.heatmap_peak_percentile))
@@ -1236,6 +1307,7 @@ class OpticalFlowProcessor:
         if mode not in ("VECTORS", "HEATMAP"):
             logger.warning("Unknown mode requested, defaulting to VECTORS job_id=%s requested_mode=%s", req_id, mode)
             mode = "VECTORS"
+        effective_flow_frame_offset = self.roi_flow_frame_offset if roi is not None else self.flow_frame_offset
 
         logger.info(
             "Video processing initializing job_id=%s mode=%s input_path=%s output_path=%s vector_direction_sign=%.1f flow_frame_offset=%s roi=%s",
@@ -1244,7 +1316,7 @@ class OpticalFlowProcessor:
             input_video_path,
             output_video_path,
             vector_direction_sign,
-            self.flow_frame_offset,
+            effective_flow_frame_offset,
             self.roi_summary(roi),
         )
         if (
@@ -1252,7 +1324,7 @@ class OpticalFlowProcessor:
             and self.execution_provider == "DmlExecutionProvider"
             and self.should_force_cpu_for_roi()
         ):
-            self.switch_to_cpu_provider("ROI/SAM2 jobs default to CPU to avoid DirectML iGPU stalls")
+            self.switch_to_cpu_provider("ROI segmentation jobs default to CPU optical-flow provider to avoid DirectML iGPU stalls")
 
         status_path = None
         if req_id is not None:
@@ -1326,16 +1398,37 @@ class OpticalFlowProcessor:
                 raise Exception(f"Invalid frame dimensions width={width} height={height}")
 
             object_masks_by_frame = None
-            if roi is not None:
-                object_masks_by_frame = self.sam2_segment_video(
-                    input_video_path=input_video_path,
-                    first_frame=first_frame,
-                    roi=roi,
-                    fps=fps,
-                    total_frames=total_frames,
-                    req_id=req_id,
-                    progress_callback=lambda percent: report_progress(min(60, int(percent * 0.6))),
-                    cancel_callback=cancel_callback,
+            if roi is not None and self.roi_segmentation_backend == "cutie":
+                try:
+                    object_masks_by_frame = self.cutie_segment_video(
+                        input_video_path=input_video_path,
+                        first_frame=first_frame,
+                        roi=roi,
+                        fps=fps,
+                        total_frames=total_frames,
+                        req_id=req_id,
+                        progress_callback=lambda percent: report_progress(min(60, int(percent * 0.6))),
+                        cancel_callback=cancel_callback,
+                    )
+                except ProcessingCancelled:
+                    raise
+                except Exception as e:
+                    if not self.roi_fallback_to_static:
+                        raise
+                    object_masks_by_frame = None
+                    logger.error(
+                        "Cutie ROI segmentation failed; falling back to static ROI job_id=%s mode=%s error=%s",
+                        req_id,
+                        mode,
+                        e,
+                        exc_info=True,
+                    )
+            elif roi is not None:
+                logger.info(
+                    "Using static ROI segmentation backend job_id=%s mode=%s backend=%s",
+                    req_id,
+                    mode,
+                    self.roi_segmentation_backend,
                 )
 
             active_roi = None if object_masks_by_frame is not None else self.active_roi(first_frame, roi, job_id=req_id)
@@ -1350,7 +1443,7 @@ class OpticalFlowProcessor:
                 width,
                 height,
                 total_frames,
-                self.flow_frame_offset,
+                effective_flow_frame_offset,
                 None if active_roi is None else {
                     "x": active_roi.x,
                     "y": active_roi.y,
@@ -1380,11 +1473,11 @@ class OpticalFlowProcessor:
                     break
 
                 frame_buffer.append(curr_frame)
-                if len(frame_buffer) <= self.flow_frame_offset:
+                if len(frame_buffer) <= effective_flow_frame_offset:
                     continue
 
-                # Match the OpenCV Zoo demo: estimate flow across a 3-frame gap,
-                # but keep this service's output frame count unchanged.
+                # Keep ROI output close to the object mask; non-ROI keeps the wider
+                # frame gap for stronger full-frame motion visualization.
                 source_frame = frame_buffer[0]
                 comparison_frame = frame_buffer[-1]
                 frame_index = frames_processed + 1
@@ -1392,7 +1485,15 @@ class OpticalFlowProcessor:
                 comparison_for_inference = comparison_frame
                 frame_active_roi = active_roi
                 if object_masks_by_frame is not None:
-                    frame_active_roi = self.active_roi_from_mask(object_masks_by_frame.get(frames_processed))
+                    frame_mask = self.mask_for_frame(object_masks_by_frame, frames_processed)
+                    comparison_mask = self.mask_for_frame(
+                        object_masks_by_frame,
+                        frames_processed + effective_flow_frame_offset,
+                    )
+                    frame_active_roi = self.active_roi_from_mask(
+                        frame_mask,
+                        extra_masks=[comparison_mask],
+                    )
                     if frame_active_roi is None:
                         out.write(source_frame)
                         frames_processed += 1

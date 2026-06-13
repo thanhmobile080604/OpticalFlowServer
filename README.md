@@ -111,30 +111,49 @@ $env:OPTICAL_FLOW_ONNX_PROVIDERS = "DmlExecutionProvider,CPUExecutionProvider"
 $env:OPTICAL_FLOW_ONNX_PROVIDERS = "CUDAExecutionProvider,CPUExecutionProvider"
 ```
 
-For Intel Iris Xe or other laptop iGPUs, ROI/SAM2 jobs can make DirectML stall the
+For Intel Iris Xe or other laptop iGPUs, ROI segmentation jobs can make DirectML stall the
 desktop. The server defaults ROI jobs to CPU for stability. Keep this setting
 unless you have a discrete GPU:
 
 ```powershell
 $env:OPTICAL_FLOW_ROI_FORCE_CPU = "true"
-$env:SAM2_TORCH_THREADS = "2"
 $env:OPTICAL_FLOW_OPENCV_THREADS = "1"
+$env:OPTICAL_FLOW_ROI_FRAME_OFFSET = "2"
+$env:OPTICAL_FLOW_ROI_MIN_MOTION = "0.05"
 ```
 
-## SAM2 Object ROI
+## Cutie Object ROI
 
-Video jobs with an ROI use SAM2 to propagate the selected object mask across the
-uploaded video. Optical-flow vectors/heatmap are then drawn only inside the SAM2
+Video jobs with an ROI use Cutie to propagate the selected object mask across the
+uploaded video. Optical-flow vectors/heatmap are then drawn only inside the Cutie
 mask for that selected object.
 
-The default test checkpoint is:
-
-```text
-AI_model\sam2.1_hiera_tiny.pt
-```
-
-Download it with:
+Cutie source is vendored in `third_party/Cutie`. Install the server
+requirements, then download the Cutie weights:
 
 ```powershell
-Invoke-WebRequest -Uri "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt" -OutFile "AI_model\sam2.1_hiera_tiny.pt"
+python -m pip install -r docs/docs_to_set_up/requirements.txt
+python third_party\Cutie\cutie\utils\download_models.py
+```
+
+Weights are intentionally ignored by git because the base checkpoint is larger
+than GitHub's normal file limit.
+
+Useful Cutie settings:
+
+```powershell
+$env:ROI_SEGMENTATION_BACKEND = "cutie"
+$env:CUTIE_WEIGHTS = "third_party\Cutie\weights\cutie-base-mega.pth"
+$env:CUTIE_DEVICE = "cpu"
+$env:CUTIE_MAX_INTERNAL_SIZE = "720"
+$env:CUTIE_MEM_EVERY = "5"
+```
+
+Use `CUTIE_DEVICE=cuda` only when PyTorch CUDA is available. On machines without
+NVIDIA CUDA, Cutie runs on CPU.
+
+For a temporary non-tracking fallback:
+
+```powershell
+$env:ROI_SEGMENTATION_BACKEND = "static"
 ```
